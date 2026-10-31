@@ -63,6 +63,7 @@
     <div class="row" style="margin-top: 10px">
       <button class="secondary" id="prev" disabled>Prev page</button>
       <button class="secondary" id="next" disabled>Next page</button>
+      <a class="secondary" id="csv" download style="display:inline-block;padding:6px 10px;border:1px solid #ccd1d8;border-radius:6px;background:#fff;color:#155eef;font:inherit;text-decoration:none;cursor:pointer">Download CSV</a>
       <span class="meta" id="pageinfo"></span>
     </div>
 
@@ -125,8 +126,23 @@
         }
       }
 
+      // The CSV download always covers every matching row: same filters and
+      // sort as the view, but no limit/cursor params (the CSV endpoint
+      // ignores them; better not to send them at all).
+      function refreshCsvHref() {
+        const q = new URLSearchParams();
+        q.set("from", $("from").value);
+        q.set("to", $("to").value);
+        for (const id of ["site_id", "responder_id", "late", "within_target"]) {
+          if ($(id).value !== "") q.set(id, $(id).value);
+        }
+        q.set("sort", activeDir === "asc" ? activeSort : `-${activeSort}`);
+        $("csv").href = `/api/requests.csv?${q}`;
+      }
+
       async function load() {
         await waitReady();
+        refreshCsvHref();
         try {
           const res = await fetch(`/api/requests?${currentQuery()}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.json().catch(() => ({}))).error ?? ""}`);

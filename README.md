@@ -37,6 +37,7 @@ graded default stay 8080.
 | `GET /ready` | 200 once the six-month report is servable (grader budget: 8 min; measured: ~65 s cold, ~4 s warm) |
 | `GET /api/sla-report?from=YYYY-MM-DD&to=YYYY-MM-DD` | one row per request + per-responder summary |
 | `GET /api/requests` | the same rows with filters (`site_id`, `responder_id`, `late`, `within_target`), sorts (`id` / `-id` / `response_business_minutes` / `-...`), keyset cursor paging |
+| `GET /api/requests.csv` | client request (finance team): every matching row as CSV, same params as `/api/requests` (limit/cursor ignored); download button on `/browse.html` |
 
 A plain page at `/` shows the report; `/browse.html` adds the level-4 browsing UI. Both show
 fetch timings and both are kept live by the sync.

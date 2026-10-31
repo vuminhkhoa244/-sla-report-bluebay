@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { state } from "./state.js";
 import { computeSlaReport } from "./rules.js";
-import { browseRows } from "./queries.js";
+import { browseRows, buildRequestsCsv } from "./queries.js";
 import { parseRange, BadInput } from "./validate.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -40,6 +40,25 @@ export function createApp(db) {
     if (!req.query.from || !req.query.to) return invalid(res, "missing or invalid from/to");
     try {
       res.json(browseRows(db, req.query));
+    } catch (err) {
+      if (err instanceof BadInput) return invalid(res, err.message);
+      throw err;
+    }
+  });
+
+  // Client request (finance team): CSV download with the same filters as the
+  // browse view. Same params as /api/requests; limit and cursor ignored.
+  app.get("/api/requests.csv", (req, res) => {
+    if (!state.ready) return res.status(503).send("not ready");
+    if (!req.query.from || !req.query.to) return invalid(res, "missing or invalid from/to");
+    try {
+      const csv = buildRequestsCsv(db, req.query);
+      res.set("Content-Type", "text/csv; charset=utf-8");
+      res.set(
+        "Content-Disposition",
+        `attachment; filename="requests-${req.query.from}-${req.query.to}.csv"`,
+      );
+      res.send(csv);
     } catch (err) {
       if (err instanceof BadInput) return invalid(res, err.message);
       throw err;
