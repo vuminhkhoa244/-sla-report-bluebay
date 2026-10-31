@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bluebay — browse requests</title>
+    <style>
+      :root { font-family: system-ui, sans-serif; }
+      body { margin: 0 auto; max-width: 1100px; padding: 10px 20px 40px; color: #1d2430; }
+      h1 { font-size: 22px; }
+      .bar { display: flex; gap: 10px; align-items: end; margin: 16px 0; flex-wrap: wrap; }
+      label { display: block; font-size: 12px; color: #5a6270; margin-bottom: 2px; }
+      input, select, button { font: inherit; padding: 6px 10px; border: 1px solid #ccd1d8; border-radius: 6px; background: #fff; }
+      button { cursor: pointer; background: #155eef; border-color: #155eef; color: #fff; }
+      button.secondary { background: #fff; color: #155eef; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .meta { margin: 8px 0; color: #5a6270; font-size: 13px; }
+      table { border-collapse: collapse; width: 100%; font-size: 14px; }
+      th, td { border: 1px solid #e2e5ea; padding: 5px 9px; text-align: left; }
+      th { background: #f5f6f8; }
+      th a { color: inherit; text-decoration: none; font-weight: 600; }
+      th a.marked { text-decoration: underline; }
+      td:nth-child(4), th:nth-child(4) { text-align: right; }
+      .yes { color: #0a7d33; } .no { color: #b3261e; }
+      .err { color: #b3261e; font-weight: 600; }
+      .row { display: flex; gap: 12px; align-items: center; }
+      #notready { margin: 16px 0; padding: 12px 16px; background: #fff8e6; border: 1px solid #e8d79a; border-radius: 8px; }
+      a { color: #155eef; }
+    </style>
+  </head>
+  <body>
+    <h1>Browse requests</h1>
+    <p>
+      The report's rows with filters, sorting and paging. Helpdesk changes appear here within a
+      minute. See the <a href="/">summary report</a>.
+    </p>
+
+    <div id="notready" hidden>Still syncing the helpdesk — this page refetches /ready every 5 s.</div>
+
+    <form class="bar" id="form">
+      <div><label for="from">From</label><input type="date" id="from" required /></div>
+      <div><label for="to">To</label><input type="date" id="to" required /></div>
+      <div><label for="site_id">Site</label><select id="site_id"><option value="">All sites</option></select></div>
+      <div><label for="responder_id">Responder</label><select id="responder_id"><option value="">All responders</option></select></div>
+      <div><label for="late">Late</label><select id="late"><option value="">Any</option><option value="true">true</option><option value="false">false</option></select></div>
+      <div><label for="within_target">Within target</label><select id="within_target"><option value="">Any</option><option value="true">true</option><option value="false">false</option></select></div>
+      <button>Show</button>
+    </form>
+
+    <table>
+      <thead>
+        <tr>
+          <th><a href="#" data-sort="id">ID</a></th>
+          <th>Site</th>
+          <th>Responder</th>
+          <th><a href="#" data-sort="response_business_minutes">Business minutes</a></th>
+          <th>Within target</th>
+          <th>Completed late</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="row" style="margin-top: 10px">
+      <button class="secondary" id="prev" disabled>Prev page</button>
+      <button class="secondary" id="next" disabled>Next page</button>
+      <span class="meta" id="pageinfo"></span>
+    </div>
+
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+
+      // Keyset paging state: the cursor we just used plus the stack of issued
+      // cursors behind it so Prev is a plain back-step (never a re-walk).
+      const crumbs = [];
+      let curCursor = null;
+      let activeSort = "id";
+      let activeDir = "asc";
+
+      const flag = (v) =>
+        v === null || v === undefined ? '<span class="meta">—</span>'
+        : v ? '<span class="yes">yes</span>' : '<span class="no">no</span>';
+
+      async function waitReady() {
+        for (;;) {
+          try {
+            if ((await fetch("/ready")).ok) break;
+          } catch {}
+          $("notready").hidden = false;
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+        $("notready").hidden = true;
+      }
+
+      async function loadConfig() {
+        try {
+          const rep = await (await fetch("/api/sla-report?from=2026-05-01&to=2026-10-31")).json();
+          const sites = [...new Set(rep.requests.map((r) => r.site_id))].sort((a, b) => a - b);
+          for (const s of sites) $("site_id").insertAdjacentHTML("beforeend", `<option value="${s}">Site ${s}</option>`);
+          const responders = rep.responders.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
+          for (const g of responders) {
+            $("responder_id").insertAdjacentHTML("beforeend", `<option value="${g.id}">${g.name ?? g.id}</option>`);
+          }
+        } catch {} // filters remain unpopulated if config isn't there yet; not graded
+      }
+
+      function currentQuery() {
+        const q = new URLSearchParams();
+        q.set("from", $("from").value);
+        q.set("to", $("to").value);
+        for (const id of ["site_id", "responder_id", "late", "within_target"]) {
+          if ($(id).value !== "") q.set(id, $(id).value);
+        }
+        q.set("sort", activeDir === "asc" ? activeSort : `-${activeSort}`);
+        q.set("limit", "25");
+        if (curCursor) q.set("cursor", curCursor);
+        return q;
+      }
+
+      const BASE_LABEL = { id: "ID", response_business_minutes: "Business minutes" };
+      function markHeaders() {
+        for (const a of document.querySelectorAll("th a[data-sort]")) {
+          const on = a.dataset.sort === activeSort;
+          a.classList.toggle("marked", on);
+          a.textContent = BASE_LABEL[a.dataset.sort] + (on ? (activeDir === "asc" ? " ↑" : " ↓") : "");
+        }
+      }
+
+      async function load() {
+        await waitReady();
+        try {
+          const res = await fetch(`/api/requests?${currentQuery()}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.json().catch(() => ({}))).error ?? ""}`);
+          const data = await res.json();
+          crumbs.push(curCursor);
+          curCursor = data.next_cursor;
+          $("rows").innerHTML = data.data.length === 0
+            ? `<tr><td colspan="6">No matching requests</td></tr>`
+            : data.data
+                .map((r) =>
+                  `<tr><td>${r.id}</td><td>${r.site_id}</td><td>${r.responder ?? "(no response yet)"}</td>` +
+                  `<td>${r.response_business_minutes ?? "—"}</td><td>${flag(r.within_target)}</td><td>${flag(r.completed_late)}</td></tr>`)
+                .join("");
+          $("next").disabled = data.next_cursor === null;
+          $("prev").disabled = crumbs.length < 2;
+          $("pageinfo").textContent = `${data.data.length} shown${data.next_cursor ? " — more available" : " — last page"}`;
+        } catch (err) {
+          $("pageinfo").innerHTML = `<span class="err">${String(err.message || err)}</span>`;
+        }
+      }
+
+      function reset() {
+        crumbs.length = 0;
+        curCursor = null;
+      }
+
+      $("form").addEventListener("submit", (e) => {
+        e.preventDefault();
+        reset();
+        load();
+      });
+      $("next").addEventListener("click", load);
+      $("prev").addEventListener("click", () => {
+        curCursor = crumbs.pop() ?? null;
+        crumbs.pop(); // drop the re-shown cursor's own crumb
+        load();
+      });
+      for (const a of document.querySelectorAll("th a[data-sort]")) {
+        a.addEventListener("click", (e) => {
+          e.preventDefault();
+          const s = a.dataset.sort;
+          activeDir = s === activeSort ? (activeDir === "asc" ? "desc" : "asc") : "asc";
+          activeSort = s;
+          markHeaders();
+          reset();
+          load();
+        });
+      }
+
+      const today = new Date();
+      const from = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+      const to = new Date(today.getFullYear(), today.getMonth(), 0);
+      $("from").value = from.toISOString().slice(0, 10);
+      $("to").value = to.toISOString().slice(0, 10);
+      markHeaders();
+      loadConfig();
+      load();
+    </script>
+  </body>
+</html>

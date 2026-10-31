@@ -6,3 +6,4 @@ log/*.log
 .env
 data/
 app/data/
+.playwright-mcp/
