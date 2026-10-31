@@ -62,6 +62,21 @@ export function openDb(path) {
     );
 
     CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT);
+
+    -- Materialized report rows (rule outcomes per request), rebuilt for the
+    -- affected requests whenever a change arrives. /ready only flips after
+    -- these exist for every synced request.
+    CREATE TABLE IF NOT EXISTS report_rows (
+      request_id INTEGER PRIMARY KEY,           -- = requests.id
+      site_id INTEGER,
+      local_date TEXT,                          -- site-local date of created_at (rule 1)
+      responder_id INTEGER,
+      response_business_minutes INTEGER,        -- floored minutes (rule 4)
+      within_target INTEGER,                    -- 1/0/NULL (rule 5)
+      completed_late INTEGER                    -- 1/0/NULL (rule 6)
+    );
+    CREATE INDEX IF NOT EXISTS idx_report_rows_date ON report_rows (local_date);
+    CREATE INDEX IF NOT EXISTS idx_report_rows_site ON report_rows (site_id);
   `);
   return db;
 }

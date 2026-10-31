@@ -6,6 +6,7 @@
 // Application of each item is an "upsert the payload as it is now" — the doc
 // says items may arrive more than once, so idempotency is the whole model.
 import { getState, setState } from "./db.js";
+import { materializeRows, materializeAll } from "./rules.js";
 
 const CHANGES_PAGE = 500; // API max
 const TAIL_IDLE_MS = 2000; // caught-up poll interval; report freshness SLA is 60s
@@ -89,12 +90,19 @@ export function upsertEvent(db, requestId, e) {
   );
 }
 
-export function applyChange(db, item) {
+export function applyChange(db, item, touched) {
   const type = item.type;
   if (type === "request.created" || type === "request.updated" || type === "request.deleted") {
-    if (item.request) upsertRequest(db, item.request);
+    if (item.request) {
+      upsertRequest(db, item.request);
+      touched?.add(Number(item.request.id));
+    }
   } else if (type === "event.created") {
-    if (item.event) upsertEvent(db, item.request_id ?? item.event.request_id, item.event);
+    if (item.event) {
+      const rid = item.request_id ?? item.event.request_id;
+      upsertEvent(db, rid, item.event);
+      touched?.add(Number(rid));
+    }
   } else if (type === "staff.updated" || type === "staff.created") {
     const s = item.staff;
     if (s && s.id !== undefined) {
@@ -117,15 +125,20 @@ export function applyChange(db, item) {
   }
 }
 
+// Applies a page of change items (upserts, idempotent) and refreshes the
+// materialized report rows for every touched request. Returns the touched ids.
 export function applyChanges(db, items) {
+  const touched = new Set();
   db.exec("BEGIN");
   try {
-    for (const item of items) applyChange(db, item);
+    for (const item of items) applyChange(db, item, touched);
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
   }
+  materializeRows(db, touched);
+  return touched;
 }
 
 // Sites, holidays and staff come from their own endpoints (the change feed is
@@ -189,7 +202,7 @@ export async function walkChanges(client, db, startCursor, logger = console) {
       throw err;
     }
     const items = res.data ?? [];
-    applyChanges(db, items);
+    applyChanges(db, items); // applies + materializes touched rows
     if (items.length > 0) {
       const maxSeq = Math.max(...items.map((c) => Number(c.seq ?? 0)));
       setState(db, "last_seq", String(Math.max(Number(getState(db, "last_seq", "0")) || 0, maxSeq)));
@@ -211,29 +224,37 @@ export async function backfill(client, db, logger = console) {
 }
 
 // Tails the feed forever. Fire-and-forget; errors are logged and retried, never
-// allowed to kill the process.
-export function startTail(client, db, cursor0, logger = console) {
+// allowed to kill the process. Returns a handle with stop() (tests use it).
+export function startTail(client, db, cursor0, logger = console, idleMs = TAIL_IDLE_MS) {
+  const control = { stopped: false, stop() { control.stopped = true; } };
   (async () => {
     let cursor = cursor0;
-    for (;;) {
+    while (!control.stopped) {
       try {
         cursor = await walkChanges(client, db, cursor, logger);
         if (cursor) setState(db, "cursor", cursor);
-        await new Promise((r) => setTimeout(r, TAIL_IDLE_MS));
+        await new Promise((r) => setTimeout(r, control.stopped ? 0 : idleMs));
       } catch (err) {
         logger.error(`sync tail error: ${err && err.message}`);
         await new Promise((r) => setTimeout(r, TAIL_ERROR_MS));
       }
     }
   })();
+  return control;
 }
 
-// One-shot boot sequence: config, backfill, ready, tail. The daemon refresh of
-// config happens in server.js so this stays testable.
+// One-shot boot sequence: config, backfill, rebuild rows, ready, tail.
+// Returns the tail control handle so tests can stop it; the daemon config
+// refresh lives in server.js.
 export async function runSync(client, db, state, logger = console) {
   await refreshConfig(client, db, logger);
   await backfill(client, db, logger);
+  // Rebuild all rows once: keeps resumed stores (cursor already advanced,
+  // nothing re-applied) consistent with the synced tables.
+  const t1 = Date.now();
+  const n = materializeAll(db);
+  logger.log(`sync: rebuilt ${n} report rows in ${((Date.now() - t1) / 1000).toFixed(1)}s`);
   state.ready = true;
   logger.log("sync: ready (backfill complete)");
-  startTail(client, db, getState(db, "cursor") ?? undefined, logger);
+  return startTail(client, db, getState(db, "cursor") ?? undefined, logger);
 }

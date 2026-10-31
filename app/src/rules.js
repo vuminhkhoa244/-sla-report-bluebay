@@ -147,86 +147,112 @@ export function computeRow(req, events, lookups) {
   };
 }
 
-// Epoch window [min, max] in which a request's created_at must fall for its
-// SITE-LOCAL date (rule 1) to possibly lie in [from, to].
-function epochWindow(lookups, from, to) {
-  const moments = [];
-  for (const { timezone } of lookups.sites.values()) {
-    if (!timezone) continue;
-    moments.push(zonedToEpochSec(from, "00:00", timezone));
-    moments.push(zonedToEpochSec(to, "23:59:59", timezone));
-  }
-  // Sites not yet synced would break the window's correctness; fall back wide.
-  if (moments.length === 0) {
-    return [Date.parse(`${from}T00:00:00Z`) / 1000 - 50400, Date.parse(`${to}T23:59:59Z`) / 1000 + 50400];
-  }
-  return [Math.min(...moments) - 86400, Math.max(...moments) + 86400];
-}
+// --- materialized rows -----------------------------------------------------
+//
+// The report and the browse endpoint read rule outcomes from report_rows,
+// which sync keeps fresh (see materializeRows). Pure SQL below this point is
+// what makes a six-month report ~instant and keyset pagination safe while the
+// data churns mid-walk.
 
-export function computeSlaReport(db, { from, to }) {
-  const lookups = buildLookups(db);
-  const [lo, hi] = epochWindow(lookups, from, to);
+const localDateOfReq = (req, lookups) => {
+  const site = lookups.sites.get(req.site_id);
+  return localDateStr(zonedParts(req.created_at, site?.timezone ?? "UTC"));
+};
 
-  const candidates = db
-    .prepare(
-      `SELECT id, site_id, status, priority, created_at, deleted_at, merged_into_id
-       FROM requests WHERE created_at IS NOT NULL AND created_at >= ? AND created_at <= ?`,
-    )
-    .all(lo, hi);
-
-  const rows = [];
-  for (const req of candidates) {
-    const p = zonedParts(req.created_at, lookups.sites.get(req.site_id)?.timezone ?? "UTC");
-    const localDate = localDateStr(p);
-    if (localDate < from || localDate > to) continue; // rule 1, exact
-    if (req.status === "canceled" || req.deleted_at !== null || req.merged_into_id !== null) continue; // rule 1
-    rows.push(req);
-  }
-
-  // Events for exactly the surviving requests, via a temp scope table (12k+ IN
-  // params is past most SQLite variable limits; a join table is now size-proof).
-  db.exec(`CREATE TEMP TABLE IF NOT EXISTS report_scope (request_id INTEGER PRIMARY KEY);
-           DELETE FROM report_scope`);
+// Recompute the report row for specific requests from their current synced
+// data (delete-then-insert; a request that drops out of the rules — canceled,
+// deleted, merged — simply loses its row).
+export function materializeRows(db, ids, lookups = buildLookups(db)) {
+  if (!ids || ids.size === 0) return 0;
+  const reqStmt = db.prepare(
+    "SELECT id, site_id, status, priority, created_at, deleted_at, merged_into_id FROM requests WHERE id = ?",
+  );
+  const evStmt = db.prepare(
+    "SELECT id, status, at, actor_id, due_at, reverts_id FROM events WHERE request_id = ? ORDER BY at, id",
+  );
+  const del = db.prepare("DELETE FROM report_rows WHERE request_id = ?");
+  const ins = db.prepare(
+    "INSERT INTO report_rows (request_id, site_id, local_date, responder_id, response_business_minutes, within_target, completed_late) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  );
   db.exec("BEGIN");
   try {
-    const ins = db.prepare("INSERT OR IGNORE INTO report_scope VALUES (?)");
-    for (const r of rows) ins.run(r.id);
+    let counted = 0;
+    for (const id of ids) {
+      del.run(id);
+      const req = reqStmt.get(id);
+      if (!req || req.created_at === null) continue;
+      if (req.status === "canceled" || req.deleted_at !== null || req.merged_into_id !== null) continue; // rule 1
+      const evts = retainableEvents(evStmt.all(id));
+      const row = computeRow(req, evts, lookups);
+      ins.run(
+        id,
+        row.site_id,
+        localDateOfReq(req, lookups),
+        row.responder_id,
+        row.response_business_minutes,
+        row.within_target === null ? null : row.within_target ? 1 : 0,
+        row.completed_late === null ? null : row.completed_late ? 1 : 0,
+      );
+      counted++;
+    }
     db.exec("COMMIT");
+    return counted;
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
   }
-  const eventsByReq = new Map();
-  for (const e of db
+}
+
+// Startup/dev fallback: materialize every request. runSync calls this once
+// after backfill so a resumed store (cursor already advanced) still gets rows.
+export function materializeAll(db) {
+  const ids = db.prepare("SELECT id FROM requests WHERE created_at IS NOT NULL").all().map((r) => r.id);
+  return materializeRows(db, new Set(ids));
+}
+
+const boolOf = (v) => (v === null || v === undefined ? null : v === 1 || v === true);
+
+export function reportRows(db, from, to) {
+  return db
     .prepare(
-      `SELECT e.request_id, e.id, e.status, e.at, e.actor_id, e.due_at, e.reverts_id
-       FROM events e JOIN report_scope s ON e.request_id = s.request_id ORDER BY e.request_id, e.at, e.id`,
+      `SELECT rr.request_id AS id, rr.site_id AS site_id, rr.responder_id,
+              rr.response_business_minutes, rr.within_target, rr.completed_late,
+              st.name AS responder
+       FROM report_rows rr LEFT JOIN staff st ON st.id = rr.responder_id
+       WHERE rr.local_date >= ? AND rr.local_date <= ?
+       ORDER BY rr.request_id`,
     )
-    .all()) {
-    let list = eventsByReq.get(e.request_id);
-    if (!list) eventsByReq.set(e.request_id, (list = []));
-    list.push(e);
-  }
+    .all(from, to)
+    .map((r) => ({
+      id: r.id,
+      site_id: r.site_id,
+      responder_id: r.responder_id,
+      responder: r.responder ?? null, // current name from staff (rule 3)
+      response_business_minutes: r.response_business_minutes,
+      within_target: boolOf(r.within_target),
+      completed_late: boolOf(r.completed_late),
+    }));
+}
 
-  const outRows = [];
-  const responders = new Map(); // responder_id -> summary (rule 3 responder keys)
-  for (const req of rows) {
-    const evts = retainableEvents(eventsByReq.get(req.id) ?? []);
-    const row = computeRow(req, evts, lookups);
-    outRows.push(row);
-    if (row.responder_id !== null) {
-      let agg = responders.get(row.responder_id);
-      if (!agg) responders.set(row.responder_id, (agg = { id: row.responder_id, name: row.responder, requests: 0, within_target: 0, completed_late: 0 }));
-      agg.requests++;
-      if (row.within_target === true) agg.within_target++;
-      if (row.completed_late === true) agg.completed_late++;
-    }
-  }
-
-  return {
-    from,
-    to,
-    requests: outRows,
-    responders: [...responders.values()],
-  };
+export function computeSlaReport(db, { from, to }) {
+  const requests = reportRows(db, from, to);
+  const agg = db
+    .prepare(
+      `SELECT responder_id, COUNT(*) AS requests,
+              SUM(CASE WHEN within_target = 1 THEN 1 ELSE 0 END) AS within_target_count,
+              SUM(CASE WHEN completed_late = 1 THEN 1 ELSE 0 END) AS completed_late_count
+       FROM report_rows
+       WHERE local_date >= ? AND local_date <= ? AND responder_id IS NOT NULL
+       GROUP BY responder_id`,
+    )
+    .all(from, to);
+  const staff = buildLookups(db).staff;
+  const responders = agg.map((a) => ({
+    id: a.responder_id,
+    name: staff.get(a.responder_id) ?? null,
+    requests: a.requests,
+    within_target: a.within_target_count,
+    completed_late: a.completed_late_count,
+  }));
+  return { from, to, requests, responders };
 }

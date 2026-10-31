@@ -12,6 +12,7 @@ import {
   retainableEvents,
   parseDueAt,
   normalizeHoliday,
+  materializeAll,
 } from "../src/rules.js";
 
 // --- time.js -------------------------------------------------------------
@@ -126,6 +127,7 @@ function seed(db, overrides = {}) {
     ).run(e.request_id, e.id, e.status, ts(e.at), e.actor_id ?? null, "", e.due_at ?? null, e.reverts_id ?? null);
   }
   db.exec("RELEASE seed");
+  materializeAll(db); // rules tests read the materialized rows now
 }
 
 const ts = (s) => (typeof s === "number" ? s : Date.parse(s) / 1000);

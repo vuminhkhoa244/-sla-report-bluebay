@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createApp, parseRange } from "../src/app.js";
+import { createApp } from "../src/app.js";
+import { parseRange, BadInput } from "../src/validate.js";
 
 function get(server, pathname) {
   const path = new URL(pathname, `http://127.0.0.1:${server.address().port}`);
@@ -40,8 +41,8 @@ test("GET /ready is 503 until the sync says otherwise", async () => {
 
 test("parseRange rejects malformed ranges", () => {
   assert.deepEqual(parseRange({ from: "2026-10-01", to: "2026-10-31" }), { from: "2026-10-01", to: "2026-10-31" });
-  assert.equal(parseRange({}), null);
-  assert.equal(parseRange({ from: "01/10/2026", to: "2026-10-31" }), null);
-  assert.equal(parseRange({ from: "2026-02-31", to: "2026-10-31" }), null); // fake date
-  assert.equal(parseRange({ from: "2026-10-31", to: "2026-10-01" }), null); // reversed
+  assert.throws(() => parseRange({}), BadInput);
+  assert.throws(() => parseRange({ from: "01/10/2026", to: "2026-10-31" }), BadInput);
+  assert.throws(() => parseRange({ from: "2026-02-31", to: "2026-10-31" }), BadInput); // fake date
+  assert.throws(() => parseRange({ from: "2026-10-31", to: "2026-10-01" }), BadInput); // reversed
 });

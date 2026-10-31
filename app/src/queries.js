@@ -1,0 +1,133 @@
+// Level 4: /api/requests — the report rows, filterable, sortable, and paged
+// with keyset cursors over the materialized report_rows table.
+//
+// Keyset is what honors the contract's exactly-once property: the cursor stores
+// the sort key + id of the last row, so a page boundary is a stable property of
+// the row itself and re-reads can never duplicate a row that keeps matching.
+import {
+  parseRange,
+  parseLimit,
+  parseIdFilter,
+  parseBoolFilter,
+  parseSort,
+  encodeCursor,
+  decodeCursor,
+  BadInput,
+} from "./validate.js";
+
+const SORT_SPEC = {
+  id: { col: "rr.request_id", dir: "ASC" },
+  "-id": { col: "rr.request_id", dir: "DESC" },
+  response_business_minutes: { col: "rr.response_business_minutes", dir: "ASC" },
+  "-response_business_minutes": { col: "rr.response_business_minutes", dir: "DESC" },
+};
+
+export function browseRows(db, query) {
+  const { from, to } = parseRange(query);
+  const limit = parseLimit(query);
+  const siteId = parseIdFilter(query, "site_id");
+  const responderId = parseIdFilter(query, "responder_id");
+  const late = parseBoolFilter(query, "late");
+  const withinTarget = parseBoolFilter(query, "within_target");
+  const sort = parseSort(query);
+  const cursorRaw = query.cursor;
+  let cursorPayload = null;
+  if (cursorRaw !== undefined && cursorRaw !== "") {
+    cursorPayload = decodeCursor(cursorRaw);
+    if (cursorPayload.s !== sort) throw new BadInput("cursor does not match sort order");
+    const key = cursorPayload.k;
+    const okShape =
+      (sort === "id" || sort === "-id"
+        ? key.length === 1 && typeof key[0] === "number" && Number.isFinite(key[0])
+        : key.length === 2 &&
+          ((key[0] === null && typeof key[1] === "number" && Number.isFinite(key[1])) ||
+            (typeof key[0] === "number" && Number.isFinite(key[0]) && typeof key[1] === "number" && Number.isFinite(key[1]))));
+    if (!okShape) throw new BadInput("invalid cursor");
+  }
+
+  const wheres = [`rr.local_date >= ?`, `rr.local_date <= ?`];
+  const params = [from, to];
+  if (siteId !== undefined) {
+    wheres.push(`rr.site_id = ?`);
+    params.push(siteId);
+  }
+  if (responderId !== undefined) {
+    wheres.push(`rr.responder_id = ?`);
+    params.push(responderId);
+  }
+  if (late !== undefined) {
+    wheres.push(`rr.completed_late = ?`);
+    params.push(late ? 1 : 0);
+  }
+  if (withinTarget !== undefined) {
+    wheres.push(`rr.within_target = ?`);
+    params.push(withinTarget ? 1 : 0);
+  }
+
+  const spec = SORT_SPEC[sort];
+  let orderBy;
+  if (sort === "id" || sort === "-id") {
+    orderBy = `rr.request_id ${spec.dir}`;
+  } else {
+    // Nulls last: order by the IS NULL flag first. Within equal sort keys,
+    // ties by id ascending (docs), for both directions.
+    orderBy = `(rr.response_business_minutes IS NULL) ASC, rr.response_business_minutes ${spec.dir}, rr.request_id ASC`;
+  }
+
+  const activeWhere = wheres.join(" AND ");
+  if (cursorPayload) {
+    if (sort === "id" || sort === "-id") {
+      const [id] = cursorPayload.k;
+      wheres.push(`rr.request_id ${spec.dir === "ASC" ? ">" : "<"} ?`);
+      params.push(id);
+    } else {
+      const [rbmKey, idKey] = cursorPayload.k;
+      const op = spec.dir === "ASC" ? ">" : "<";
+      // The nulls-last group is entirely after the non-null group in BOTH
+      // directions, so from a non-null cursor every null row is still ahead
+      // (no id filter); from a null cursor only the null group remains.
+      if (rbmKey === null) {
+        wheres.push(`rr.response_business_minutes IS NULL AND rr.request_id > ?`);
+        params.push(idKey);
+      } else {
+        wheres.push(
+          `((rr.response_business_minutes IS NOT NULL AND (rr.response_business_minutes ${op} ? OR (rr.response_business_minutes = ? AND rr.request_id > ?))) OR rr.response_business_minutes IS NULL)`,
+        );
+        params.push(rbmKey, rbmKey, idKey);
+      }
+    }
+  }
+
+  // Fetch limit+1: an extra row only decides next_cursor, never goes out.
+  const sql = `SELECT rr.request_id AS id, rr.site_id, rr.responder_id,
+         rr.response_business_minutes, rr.within_target, rr.completed_late, st.name AS responder
+       FROM report_rows rr LEFT JOIN staff st ON st.id = rr.responder_id
+       WHERE ${wheres.join(" AND ")}
+       ORDER BY ${orderBy}
+       LIMIT ?`;
+  const rows = db.prepare(sql).all(...params, limit + 1);
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+  const boolOf = (v) => (v === null || v === undefined ? null : v === 1 || v === true);
+  const data = page.map((r) => ({
+    id: r.id,
+    site_id: r.site_id,
+    responder_id: r.responder_id,
+    responder: r.responder ?? null,
+    response_business_minutes: r.response_business_minutes,
+    within_target: boolOf(r.within_target),
+    completed_late: boolOf(r.completed_late),
+  }));
+  let nextCursor = null;
+  if (hasMore) {
+    const last = page[page.length - 1];
+    const key =
+      sort === "id" || sort === "-id"
+        ? [last.id]
+        : [last.response_business_minutes, last.id];
+    nextCursor = encodeCursor({ s: sort, k: key });
+  }
+  return { data, next_cursor: nextCursor };
+}
+
+export { BadInput };

@@ -3,30 +3,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { state } from "./state.js";
 import { computeSlaReport } from "./rules.js";
+import { browseRows } from "./queries.js";
+import { parseRange, BadInput } from "./validate.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-// Validates ?from and ?to as real YYYY-MM-DD calendar dates, from <= to.
-// Returns {from, to} or null (meaning 400).
-export function parseRange(query) {
-  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
-  const from = query.from;
-  const to = query.to;
-  if (typeof from !== "string" || typeof to !== "string") return null;
-  if (!dateRe.test(from) || !dateRe.test(to)) return null;
-  // String comparison alone would accept 2026-02-31; build the date back.
-  const parse = (s) => {
-    const [y, m, d] = s.split("-").map(Number);
-    const dt = new Date(Date.UTC(y, m - 1, d));
-    return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d ? dt : null;
-  };
-  const fromD = parse(from);
-  const toD = parse(to);
-  if (!fromD || !toD || fromD > toD) return null;
-  return { from, to };
-}
+const invalid = (res, message) => res.status(400).json({ error: message });
 
-export function createApp(db, rules) {
+export function createApp(db) {
   const app = express();
 
   app.use(express.static(path.join(here, "..", "public")));
@@ -42,15 +26,24 @@ export function createApp(db, rules) {
 
   app.get("/api/sla-report", (req, res) => {
     if (!state.ready) return res.status(503).json({ error: "not ready" });
-    const range = parseRange(req.query);
-    if (!range) return res.status(400).json({ error: "invalid from/to (need YYYY-MM-DD, from <= to)" });
+    let range;
+    try {
+      range = parseRange(req.query);
+    } catch (err) {
+      return invalid(res, err.message);
+    }
     res.json(computeSlaReport(db, range));
   });
 
   app.get("/api/requests", (req, res) => {
-    // Level 4: filters, sorting and keyset pagination over the same rows.
-    // Implemented in queries.js; wired here in milestone 5.
-    res.status(501).json({ error: "not implemented" });
+    if (!state.ready) return res.status(503).json({ error: "not ready" });
+    if (!req.query.from || !req.query.to) return invalid(res, "missing or invalid from/to");
+    try {
+      res.json(browseRows(db, req.query));
+    } catch (err) {
+      if (err instanceof BadInput) return invalid(res, err.message);
+      throw err;
+    }
   });
 
   return app;
