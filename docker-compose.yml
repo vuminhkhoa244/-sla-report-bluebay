@@ -10,3 +10,7 @@ services:
       HELPDESK_URL: ${HELPDESK_URL}
       HELPDESK_TOKEN: ${HELPDESK_TOKEN}
       PORT: "8080"
+      DB_PATH: /app/data/db.sqlite
+    volumes:
+      # SQLite copy survives container rebuilds: no re-backfill on restart.
+      - ./data:/app/data
