@@ -5,7 +5,9 @@ services:
   app:
     build: ./app
     ports:
-      - "8080:8080"
+      # Graded runs use the default 8080. Override HOST_APP_PORT locally
+      # (e.g. in .env when another container already owns 8080).
+      - "${HOST_APP_PORT:-8080}:8080"
     environment:
       HELPDESK_URL: ${HELPDESK_URL}
       HELPDESK_TOKEN: ${HELPDESK_TOKEN}
