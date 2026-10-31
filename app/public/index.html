@@ -1,30 +1,141 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Response-time report</title>
-</head>
-<body>
-  <h1>Response-time report</h1>
-  <form id="f">
-    <label>From <input type="date" name="from" required></label>
-    <label>To <input type="date" name="to" required></label>
-    <button type="submit">Run report</button>
-  </form>
-  <p id="status"></p>
-  <table id="report" border="1">
-    <thead></thead>
-    <tbody></tbody>
-  </table>
-  <script>
-    document.getElementById("f").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const params = new URLSearchParams(new FormData(e.target));
-      const res = await fetch("/api/sla-report?" + params);
-      const data = await res.json();
-      // TODO: render `data` into the table.
-      document.getElementById("status").textContent = res.status + " " + JSON.stringify(data);
-    });
-  </script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bluebay response-time report</title>
+    <style>
+      :root { font-family: system-ui, sans-serif; }
+      body { margin: 0 auto; max-width: 1100px; padding: 10px 20px 40px; color: #1d2430; }
+      h1 { font-size: 22px; }
+      .bar { display: flex; gap: 10px; align-items: end; margin: 16px 0; flex-wrap: wrap; }
+      label { display: block; font-size: 12px; color: #5a6270; margin-bottom: 2px; }
+      input, select, button {
+        font: inherit; padding: 6px 10px; border: 1px solid #ccd1d8; border-radius: 6px; background: #fff;
+      }
+      button { cursor: pointer; background: #155eef; border-color: #155eef; color: #fff; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .meta { margin: 12px 0 6px; color: #5a6270; font-size: 13px; }
+      table { border-collapse: collapse; width: 100%; font-size: 14px; margin-bottom: 28px; }
+      th, td { border: 1px solid #e2e5ea; padding: 5px 9px; text-align: left; }
+      th { background: #f5f6f8; font-weight: 600; white-space: nowrap; }
+      td:nth-child(4), th:nth-child(4) { text-align: right; }
+      .yes { color: #0a7d33; } .no { color: #b3261e; }
+      .err { color: #b3261e; font-weight: 600; }
+      h2 { font-size: 17px; margin-top: 8px; }
+      #notready { margin: 16px 0; padding: 12px 16px; background: #fff8e6; border: 1px solid #e8d79a; border-radius: 8px; }
+      a { color: #155eef; }
+    </style>
+  </head>
+  <body>
+    <h1>Bluebay Properties — response-time report</h1>
+    <p>
+      One line per helpdesk request raised in the chosen date range (site-local calendar days,
+      inclusive). See <a href="/browse.html">Browse requests</a>.
+    </p>
+
+    <div id="notready" hidden>
+      Still syncing the helpdesk (first pull takes a while) — this page refetches /ready every 5 s.
+    </div>
+
+    <form class="bar" id="form">
+      <div><label for="from">From</label><input type="date" id="from" required /></div>
+      <div><label for="to">To</label><input type="date" id="to" required /></div>
+      <button id="go">Show report</button>
+      <span class="meta" id="elapsed"></span>
+    </form>
+
+    <div class="meta" id="status"></div>
+
+    <h2>Responders</h2>
+    <table aria-label="Summary per responder">
+      <thead>
+        <tr><th>Responder</th><th>Requests</th><th>Within target</th><th>Completed late</th></tr>
+      </thead>
+      <tbody id="responders"></tbody>
+    </table>
+
+    <h2>Requests</h2>
+    <table aria-label="One line per request">
+      <thead>
+        <tr><th>ID</th><th>Site</th><th>Responder</th><th>Business minutes</th><th>Within target</th><th>Completed late</th></tr>
+      </thead>
+      <tbody id="requests"></tbody>
+    </table>
+
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      const els = {
+        notready: $("notready"), status: $("status"), elapsed: $("elapsed"),
+        responders: $("responders"), requests: $("requests"),
+        from: $("from"), to: $("to"), go: $("go"),
+      };
+      const flag = (v) =>
+        v === null || v === undefined ? '<span class="meta">—</span>'
+        : v ? '<span class="yes">yes</span>' : '<span class="no">no</span>';
+
+      function readyCheck() {
+        return fetch("/ready").then((r) => r.ok).catch(() => false);
+      }
+      async function waitReady() {
+        els.notready.hidden = false;
+        while (!(await readyCheck())) await new Promise((r) => setTimeout(r, 5000));
+        els.notready.hidden = true;
+      }
+
+      async function run(ev) {
+        if (ev) ev.preventDefault();
+        els.go.disabled = true;
+        els.status.textContent = "";
+        els.responders.textContent = "";
+        els.requests.textContent = "";
+        if (!(await readyCheck())) await waitReady();
+
+        const url = `/api/sla-report?from=${els.from.value}&to=${els.to.value}`;
+        const t0 = performance.now();
+        try {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.json().catch(() => ({}))).error ?? ""}`);
+          const data = await res.json();
+          const ms = Math.round(performance.now() - t0);
+          els.elapsed.textContent = `${data.requests.length} requests in ${ms} ms`;
+          els.status.textContent = `${data.from} → ${data.to}`;
+
+          els.responders.innerHTML = data.responders.length === 0
+            ? `<tr><td colspan="4">No responded requests in range</td></tr>`
+            : data.responders
+                .slice()
+                .sort((a, b) => b.requests - a.requests)
+                .map((g) =>
+                  `<tr><td>${g.name ?? "(unnamed)"}</td><td>${g.requests}</td>` +
+                  `<td>${g.within_target}/${g.requests}</td><td>${g.completed_late}/${g.requests}</td></tr>`)
+                .join("");
+
+          els.requests.innerHTML = data.requests.length === 0
+            ? `<tr><td colspan="6">No requests in range</td></tr>`
+            : data.requests
+                .slice()
+                .sort((a, b) => a.id - b.id)
+                .map((r) =>
+                  `<tr><td>${r.id}</td><td>${r.site_id}</td><td>${r.responder ?? "(no response yet)"}</td>` +
+                  `<td>${r.response_business_minutes ?? "—"}</td><td>${flag(r.within_target)}</td><td>${flag(r.completed_late)}</td></tr>`)
+                .join("");
+        } catch (err) {
+          els.status.innerHTML = `<span class="err">${String(err.message || err)}</span>`;
+        } finally {
+          els.go.disabled = false;
+        }
+      }
+
+      // Default to the last full month.
+      const today = new Date();
+      const from = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+      const to = new Date(today.getFullYear(), today.getMonth(), 0);
+      els.from.value = from.toISOString().slice(0, 10);
+      els.to.value = to.toISOString().slice(0, 10);
+
+      $("form").addEventListener("submit", run);
+      run();
+    </script>
+  </body>
 </html>
