@@ -2,6 +2,7 @@ import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { state } from "./state.js";
+import { computeSlaReport } from "./rules.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,8 +44,7 @@ export function createApp(db, rules) {
     if (!state.ready) return res.status(503).json({ error: "not ready" });
     const range = parseRange(req.query);
     if (!range) return res.status(400).json({ error: "invalid from/to (need YYYY-MM-DD, from <= to)" });
-    // milestone 2 wires the rules engine here
-    res.status(501).json({ error: "not implemented" });
+    res.json(computeSlaReport(db, range));
   });
 
   app.get("/api/requests", (req, res) => {
